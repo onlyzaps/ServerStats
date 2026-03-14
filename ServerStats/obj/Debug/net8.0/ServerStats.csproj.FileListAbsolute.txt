@@ -1,0 +1,14 @@
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\bin\Debug\net8.0\ServerStats.deps.json
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\bin\Debug\net8.0\ServerStats.dll
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\bin\Debug\net8.0\ServerStats.pdb
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\bin\Debug\net8.0\CounterStrikeSharp.API.dll
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\ServerStats.csproj.AssemblyReference.cache
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\ServerStats.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\ServerStats.AssemblyInfoInputs.cache
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\ServerStats.AssemblyInfo.cs
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\ServerStats.csproj.CoreCompileInputs.cache
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\ServerSt.2AE20CFB.Up2Date
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\ServerStats.dll
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\refint\ServerStats.dll
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\ServerStats.pdb
+C:\Users\vindict6\Desktop\ServerStats-master\ServerStats\obj\Debug\net8.0\ref\ServerStats.dll

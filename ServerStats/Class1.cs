@@ -195,6 +195,7 @@ namespace ServerStats
         private int _highestZeusKills = 0;
 
         private CsTimer? _spectatorKickTimer = null;
+        private CsTimer? _noHumansRestartTimer = null;
 
         private string _steamApiKey = "";
         private const string WorkshopContentRelPath = "../bin/linuxsteamrt64/steamapps/workshop/content/730";
@@ -282,6 +283,18 @@ namespace ServerStats
 
         public override void Unload(bool hotReload)
         {
+            if (_noHumansRestartTimer != null)
+            {
+                _noHumansRestartTimer.Kill();
+                _noHumansRestartTimer = null;
+            }
+
+            if (_spectatorKickTimer != null)
+            {
+                _spectatorKickTimer.Kill();
+                _spectatorKickTimer = null;
+            }
+
             if (_fileWatcher != null)
             {
                 _fileWatcher.EnableRaisingEvents = false;
@@ -862,10 +875,10 @@ collection_id=";
                     p.Slot != player.Slot &&
                     (p.TeamNum == 2 || p.TeamNum == 3));
 
-                if (remainingActiveHumans == 0)
+                if (remainingActiveHumans == 0 && _noHumansRestartTimer == null)
                 {
-                    Console.WriteLine("[ServerStats] Last active human left. Restarting game to reset match.");
-                    Server.ExecuteCommand("mp_restartgame 1");
+                    Console.WriteLine("[ServerStats] No active humans detected. Scheduling restart in 30 seconds.");
+                    _noHumansRestartTimer = AddTimer(30.0f, OnNoHumansRestartTimer);
                 }
 
                 CheckAndHandlePlayerCounts(player.Slot);
@@ -917,11 +930,50 @@ collection_id=";
                     _spectatorKickTimer = null;
                     Server.PrintToChatAll(" [ServerStats] Active player joined. Spectator kick timer cancelled.");
                 }
+                CancelNoHumansRestartTimer();
             }
             else if (activeHumans == 0 && specHumans == 0 && _spectatorKickTimer != null)
             {
                 _spectatorKickTimer.Kill();
                 _spectatorKickTimer = null;
+            }
+        }
+
+        private void CancelNoHumansRestartTimer()
+        {
+            if (_noHumansRestartTimer != null)
+            {
+                _noHumansRestartTimer.Kill();
+                _noHumansRestartTimer = null;
+                Console.WriteLine("[ServerStats] No-humans restart timer cancelled. Active players present.");
+            }
+        }
+
+        private void OnNoHumansRestartTimer()
+        {
+            _noHumansRestartTimer = null;
+
+            try
+            {
+                var activeHumans = Utilities.GetPlayers().Count(p =>
+                    p != null &&
+                    p.IsValid &&
+                    !p.IsBot &&
+                    !p.IsHLTV &&
+                    (p.TeamNum == 2 || p.TeamNum == 3));
+
+                if (activeHumans > 0)
+                {
+                    Console.WriteLine("[ServerStats] No-humans restart aborted. Active players found.");
+                    return;
+                }
+
+                Console.WriteLine("[ServerStats] Last active human left. Restarting game to reset match.");
+                Server.ExecuteCommand("mp_restartgame 1");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ServerStats] No-humans restart timer error (possibly mid-map-transition): {ex.Message}");
             }
         }
 
