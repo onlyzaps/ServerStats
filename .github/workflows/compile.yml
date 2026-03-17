@@ -1,159 +1,66 @@
-name: Build and Release Plugin
+name: Compile and Release ServerStats
 
 on:
   push:
     branches:
       - main
-      - master
-  pull_request:
-    branches:
-      - main
-      - master
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+permissions:
+  contents: write
 
 jobs:
-  # Auto-tag on merge to main/master
-  tag:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      new_tag: ${{ steps.bump_version.outputs.new_tag }}
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-      
-      - name: Get latest tag
-        id: get_latest_tag
-        run: |
-          # Get the latest tag, or use v1.0.0 if no tags exist
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
-          echo "latest_tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
-          echo "Latest tag: ${LATEST_TAG}"
-      
-      - name: Bump version
-        id: bump_version
-        run: |
-          LATEST_TAG="${{ steps.get_latest_tag.outputs.latest_tag }}"
-          
-          # Remove 'v' prefix and split into parts
-          VERSION=${LATEST_TAG#v}
-          IFS='.' read -r -a VERSION_PARTS <<< "$VERSION"
-          
-          MAJOR="${VERSION_PARTS[0]}"
-          MINOR="${VERSION_PARTS[1]:-0}"
-          PATCH="${VERSION_PARTS[2]:-0}"
-          
-          # Increment patch version
-          PATCH=$((PATCH + 1))
-          
-          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
-          echo "new_tag=${NEW_TAG}" >> $GITHUB_OUTPUT
-          echo "New tag: ${NEW_TAG}"
-      
-      - name: Create and push tag
-        run: |
-          NEW_TAG="${{ steps.bump_version.outputs.new_tag }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}"
-          git push origin "${NEW_TAG}"
-
-  # Build job for all events (PR, push, manual)
   build:
+    name: Build Plugin
     runs-on: ubuntu-latest
-    needs: [tag]
-    if: always() && !cancelled()
-    
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v5
+
+      - name: Bump Version and Create Tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      
-      - name: Restore dependencies
-        run: dotnet restore ServerStats/ServerStats.csproj
-      
-      - name: Build project
-        run: dotnet build ServerStats/ServerStats.csproj --configuration Release --no-restore
-      
-      - name: Publish project
-        run: dotnet publish ServerStats/ServerStats.csproj --configuration Release --no-build --output ./publish
-      
-      - name: Create release package
+
+      - name: Restore Dependencies
+        # Make sure your project file is named exactly ServerStats.csproj
+        run: dotnet restore ServerStats.csproj
+
+      - name: Build and Publish
+        run: dotnet publish ServerStats.csproj -c Release -o ./publish_temp
+
+      - name: Prepare Folder Structure
         run: |
-          mkdir -p release/addons/counterstrikesharp/plugins/ServerStats
-          cp publish/ServerStats.dll release/addons/counterstrikesharp/plugins/ServerStats/
-          cp publish/ServerStats.pdb release/addons/counterstrikesharp/plugins/ServerStats/
-          cp publish/ServerStats.deps.json release/addons/counterstrikesharp/plugins/ServerStats/ || true
-      
-      - name: Create zip file
+          mkdir -p ./release_stage/addons/counterstrikesharp/plugins/ServerStats
+          mv ./publish_temp/ServerStats.dll ./release_stage/addons/counterstrikesharp/plugins/ServerStats/
+          mv ./publish_temp/ServerStats.pdb ./release_stage/addons/counterstrikesharp/plugins/ServerStats/
+          mv ./publish_temp/ServerStats*.json ./release_stage/addons/counterstrikesharp/plugins/ServerStats/
+
+      - name: Zip Release Artifact
         run: |
-          # Determine the zip name based on context
-          if [ "${{ needs.tag.result }}" = "success" ]; then
-            ZIP_NAME="ServerStats-${{ needs.tag.outputs.new_tag }}.zip"
-          else
-            ZIP_NAME="ServerStats-build-${{ github.sha }}.zip"
-          fi
-          cd release && zip -r "../${ZIP_NAME}" . && cd ..
-          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
-      
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v5
+          cd release_stage
+          zip -r "ServerStats-${{ steps.tag_version.outputs.new_tag }}.zip" addons/
+
+      - name: Upload Build Artifact (Actions Tab)
+        uses: actions/upload-artifact@v4
         with:
-          name: ServerStats-build
-          path: ${{ env.ZIP_NAME }}
+          name: ServerStats-${{ steps.tag_version.outputs.new_tag }}
+          path: release_stage/ServerStats-${{ steps.tag_version.outputs.new_tag }}.zip
           retention-days: 7
-  
-  # Release job - only on push to main/master
-  release:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    needs: [tag, build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
-    steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v5
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
         with:
-          name: ServerStats-build
-      
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ needs.tag.outputs.new_tag }}
-          files: |
-            ServerStats-*.zip
-          body: |
-            ## ServerStats ${{ needs.tag.outputs.new_tag }}
-            
-            ### Installation
-            1. Download `ServerStats-${{ needs.tag.outputs.new_tag }}.zip`
-            2. Extract the contents to your Counter-Strike 2 server directory
-            3. The plugin will be installed at `addons/counterstrikesharp/plugins/ServerStats/`
-            4. Make sure to generate or copy your `.json` configuration file appropriately.
-            5. Restart your server
-            
-            ### Requirements
-            - CounterStrikeSharp framework installed on your server
-            - .NET 8.0 Runtime
-            
-            ### Features
-            - Tracks and logs player and server statistics. *(Feel free to update this description!)*
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.tag_version.outputs.new_tag }}
+          files: release_stage/ServerStats-${{ steps.tag_version.outputs.new_tag }}.zip
+          generate_release_notes: true
