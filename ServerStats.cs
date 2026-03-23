@@ -194,6 +194,8 @@ namespace ServerStats
         private bool _announceAces = false;
         private int _highestZeusKills = 0;
 
+        private readonly Dictionary<int, int> _lastDeathTick = new();
+
         private CsTimer? _spectatorKickTimer = null;
         private CsTimer? _noHumansRestartTimer = null;
 
@@ -625,6 +627,7 @@ namespace ServerStats
 
             // Clear lookups as the old objects are gone
             _playerLookup.Clear();
+            _lastDeathTick.Clear();
 
             _currentRound = 1;
             _matchEndedNormally = false;
@@ -1059,6 +1062,16 @@ collection_id=";
             try
             {
                 var victim = @event.Userid;
+
+                // Prevent processing duplicate events for the same death on the same tick
+                if (victim != null && victim.IsValid)
+                {
+                    int tick = Server.TickCount;
+                    if (_lastDeathTick.TryGetValue(victim.Slot, out int lastTick) && lastTick == tick)
+                        return HookResult.Continue;
+                    _lastDeathTick[victim.Slot] = tick;
+                }
+
                 var attacker = @event.Attacker;
                 var assister = @event.Assister;
                 string weaponName = @event.Weapon ?? "unknown";
