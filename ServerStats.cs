@@ -205,7 +205,7 @@ namespace ServerStats
 
         public override string ModuleName => "ServerStats";
         public override string ModuleVersion => "2.1.0";
-        public override string ModuleAuthor => "VinSix";
+        public override string ModuleAuthor => "|ZAPS| BONE";
 
         public override void Load(bool hotReload)
         {
