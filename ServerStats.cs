@@ -876,10 +876,10 @@ collection_id=";
                     p.Slot != player.Slot &&
                     (p.TeamNum == 2 || p.TeamNum == 3));
 
-                if (remainingActiveHumans == 0 && _noHumansRestartTimer == null)
+                if (remainingActiveHumans == 0 && _noHumansRestartTimer == null && !_matchEndedNormally)
                 {
-                    Console.WriteLine("[ServerStats] No active humans detected. Scheduling restart in 30 seconds.");
-                    _noHumansRestartTimer = AddTimer(30.0f, OnNoHumansRestartTimer);
+                    Console.WriteLine("[ServerStats] No active humans detected. Scheduling restart in 90 seconds.");
+                    _noHumansRestartTimer = AddTimer(90.0f, OnNoHumansRestartTimer);
                 }
 
                 CheckAndHandlePlayerCounts(player.Slot);
