@@ -198,6 +198,7 @@ namespace ServerStats
 
         private CsTimer? _spectatorKickTimer = null;
         private CsTimer? _noHumansRestartTimer = null;
+        private CancellationTokenSource _workshopCts = new();
 
         private string _steamApiKey = "";
         private const string WorkshopContentRelPath = "../bin/linuxsteamrt64/steamapps/workshop/content/730";
@@ -275,8 +276,9 @@ namespace ServerStats
             {
                 try
                 {
-                    await ProcessWorkshopCollection(baseGameDir);
+                    await ProcessWorkshopCollection(baseGameDir, _workshopCts.Token);
                 }
+                catch (OperationCanceledException) { }
                 catch (Exception ex)
                 {
                     LogWorkshopGrabber(baseGameDir, $"CRITICAL ERROR: {ex.Message}");
@@ -286,6 +288,10 @@ namespace ServerStats
 
         public override void Unload(bool hotReload)
         {
+            _workshopCts.Cancel();
+            _workshopCts.Dispose();
+            _workshopCts = new CancellationTokenSource();
+
             if (_noHumansRestartTimer != null)
             {
                 _noHumansRestartTimer.Kill();
@@ -314,7 +320,7 @@ namespace ServerStats
         private string MatchLibrarianDir => Path.Combine(Server.GameDirectory, "csgo", "addons", "counterstrikesharp", "configs", "plugins", "MatchLibrarian");
         private string MatchesDirPath => Path.Combine(MatchLibrarianDir, "matches");
 
-        private async Task ProcessWorkshopCollection(string csgoDir)
+        private async Task ProcessWorkshopCollection(string csgoDir, CancellationToken token)
         {
             string configIniPath = Path.GetFullPath(Path.Combine(csgoDir, "addons/counterstrikesharp/configs/plugins/ServerStats/config.ini"));
             string workshopIniPath = Path.GetFullPath(Path.Combine(csgoDir, "addons/counterstrikesharp/configs/plugins/ServerStats/workshop.ini"));
@@ -356,19 +362,24 @@ namespace ServerStats
                 return;
             }
 
+            token.ThrowIfCancellationRequested();
+
             LogWorkshopGrabber(csgoDir, $"Processing Collection ID from Config: {collectionId}");
 
             List<string> mapIds;
             try
             {
-                mapIds = await FetchCollectionItems(collectionId);
+                mapIds = await FetchCollectionItems(collectionId, token);
                 LogWorkshopGrabber(csgoDir, $"API success. Found {mapIds.Count} items in collection.");
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 LogWorkshopGrabber(csgoDir, $"API Request Failed: {ex.Message}");
                 return;
             }
+
+            token.ThrowIfCancellationRequested();
 
             Dictionary<string, string> validMaps = new Dictionary<string, string>();
 
@@ -433,7 +444,7 @@ namespace ServerStats
             }
         }
 
-        private async Task<List<string>> FetchCollectionItems(string collectionId)
+        private async Task<List<string>> FetchCollectionItems(string collectionId, CancellationToken token)
         {
             using var client = new HttpClient();
             var content = new FormUrlEncodedContent(new[]
@@ -443,10 +454,10 @@ namespace ServerStats
             });
 
             string url = $"https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/?key={_steamApiKey}";
-            var response = await client.PostAsync(url, content);
+            var response = await client.PostAsync(url, content, token);
             response.EnsureSuccessStatusCode();
 
-            string json = await response.Content.ReadAsStringAsync();
+            string json = await response.Content.ReadAsStringAsync(token);
             var data = JsonSerializer.Deserialize<SteamCollectionResponse>(json);
 
             List<string> ids = new List<string>();
@@ -1249,53 +1260,68 @@ collection_id=";
             if (_roundStatsSnapshotTaken) return;
             if (IsWarmup()) return;
 
-            UpdateTeamScores();
-
-            // Direct modification of _matchData properties
-            _matchData.CTWins = _ctWins;
-            _matchData.TWins = _tWins;
-            _matchData.TotalRounds = _ctWins + _tWins;
-
-            _matchData.CTScoreHistory.Add(_ctWins);
-            _matchData.TScoreHistory.Add(_tWins);
-
-            // Ensure all connected players are tracked
-            foreach (var p in Utilities.GetPlayers())
+            try
             {
-                if (p != null && p.IsValid && p.Connected == PlayerConnectedState.PlayerConnected)
+                UpdateTeamScores();
+
+                // Direct modification of _matchData properties
+                _matchData.CTWins = _ctWins;
+                _matchData.TWins = _tWins;
+                _matchData.TotalRounds = _ctWins + _tWins;
+
+                _matchData.CTScoreHistory.Add(_ctWins);
+                _matchData.TScoreHistory.Add(_tWins);
+
+                // Ensure all connected players are tracked
+                foreach (var p in Utilities.GetPlayers())
                 {
-                    GetOrAddPlayer(p);
+                    if (p != null && p.IsValid && p.Connected == PlayerConnectedState.PlayerConnected)
+                    {
+                        GetOrAddPlayer(p);
+                    }
+                }
+
+                // Update stats for all tracked players (snapshot to avoid collection-modified errors)
+                foreach (var data in _matchData.Players.ToList())
+                {
+                    try
+                    {
+                        var playerEntity = Utilities.GetPlayers().FirstOrDefault(p =>
+                        {
+                            if (p == null || !p.IsValid) return false;
+                            ulong pid = p.SteamID;
+                            if (pid == 0) pid = (ulong)p.Handle.ToInt64();
+                            return pid == data.SteamID;
+                        });
+
+                        if (playerEntity != null && playerEntity.IsValid)
+                        {
+                            UpdateLivePlayerFields(playerEntity, data);
+                        }
+                        else
+                        {
+                            data.AliveHistory.Add(false);
+                            data.InventoryHistory.Add("");
+                        }
+                    }
+                    catch
+                    {
+                        data.AliveHistory.Add(false);
+                        data.InventoryHistory.Add("");
+                    }
+
+                    data.TeamHistory.Add(data.CurrentTeam);
+                    data.KillsHistory.Add(data.CurrentKills);
+                    data.DeathsHistory.Add(data.CurrentDeaths);
+                    data.AssistsHistory.Add(data.CurrentAssists);
+                    data.ZeusKillsHistory.Add(data.CurrentZeusKills);
+                    data.MVPsHistory.Add(data.CurrentMVPs);
+                    data.ScoreHistory.Add(data.CurrentScore);
                 }
             }
-
-            // Update stats for all tracked players (snapshot to avoid collection-modified errors)
-            foreach (var data in _matchData.Players.ToList())
+            catch (Exception ex)
             {
-                var playerEntity = Utilities.GetPlayers().FirstOrDefault(p =>
-                {
-                    if (p == null || !p.IsValid) return false;
-                    ulong pid = p.SteamID;
-                    if (pid == 0) pid = (ulong)p.Handle.ToInt64();
-                    return pid == data.SteamID;
-                });
-
-                if (playerEntity != null && playerEntity.IsValid)
-                {
-                    UpdateLivePlayerFields(playerEntity, data);
-                }
-                else
-                {
-                    data.AliveHistory.Add(false);
-                    data.InventoryHistory.Add("");
-                }
-
-                data.TeamHistory.Add(data.CurrentTeam);
-                data.KillsHistory.Add(data.CurrentKills);
-                data.DeathsHistory.Add(data.CurrentDeaths);
-                data.AssistsHistory.Add(data.CurrentAssists);
-                data.ZeusKillsHistory.Add(data.CurrentZeusKills);
-                data.MVPsHistory.Add(data.CurrentMVPs);
-                data.ScoreHistory.Add(data.CurrentScore);
+                Console.WriteLine($"[ServerStats] SnapshotRoundStats error: {ex.Message}");
             }
 
             _roundStatsSnapshotTaken = true;
@@ -1438,24 +1464,31 @@ collection_id=";
 
         private string GetPlayerInventory(CCSPlayerController player)
         {
-            if (player == null || !player.IsValid || player.PlayerPawn == null || !player.PlayerPawn.IsValid)
-                return "N/A";
-
-            var pawn = player.PlayerPawn.Value;
-            if (pawn == null || !pawn.IsValid || pawn.WeaponServices == null || pawn.WeaponServices.MyWeapons == null)
-                return "None";
-
-            List<string> weaponNames = new List<string>();
-            foreach (var weaponHandle in pawn.WeaponServices.MyWeapons)
+            try
             {
-                var weapon = weaponHandle.Value;
-                if (weapon == null || !weapon.IsValid) continue;
+                if (player == null || !player.IsValid || player.PlayerPawn == null || !player.PlayerPawn.IsValid)
+                    return "N/A";
 
-                string name = weapon.DesignerName;
-                if (name.StartsWith("weapon_")) name = name.Substring(7);
-                weaponNames.Add(name);
+                var pawn = player.PlayerPawn.Value;
+                if (pawn == null || !pawn.IsValid || pawn.WeaponServices == null || pawn.WeaponServices.MyWeapons == null)
+                    return "None";
+
+                List<string> weaponNames = new List<string>();
+                foreach (var weaponHandle in pawn.WeaponServices.MyWeapons)
+                {
+                    var weapon = weaponHandle.Value;
+                    if (weapon == null || !weapon.IsValid) continue;
+
+                    string name = weapon.DesignerName;
+                    if (name.StartsWith("weapon_")) name = name.Substring(7);
+                    weaponNames.Add(name);
+                }
+                return weaponNames.Count == 0 ? "None" : string.Join(", ", weaponNames);
             }
-            return weaponNames.Count == 0 ? "None" : string.Join(", ", weaponNames);
+            catch
+            {
+                return "N/A";
+            }
         }
 
         private int GetPlayerMoney(CCSPlayerController player)
