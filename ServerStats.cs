@@ -984,24 +984,32 @@ collection_id=";
         private void KickSpectatorsAndRestart()
         {
             _spectatorKickTimer = null;
-            var allPlayers = Utilities.GetPlayers();
-            bool kicked = false;
 
-            foreach (var p in allPlayers)
+            try
             {
-                if (p != null && p.IsValid && !p.IsBot && !p.IsHLTV && p.TeamNum == 1)
+                var allPlayers = Utilities.GetPlayers();
+                bool kicked = false;
+
+                foreach (var p in allPlayers)
                 {
-                    Server.ExecuteCommand($"kickid {p.UserId} \"AFK Spectator\"");
-                    kicked = true;
+                    if (p != null && p.IsValid && !p.IsBot && !p.IsHLTV && p.TeamNum == 1)
+                    {
+                        Server.ExecuteCommand($"kickid {p.UserId} \"AFK Spectator\"");
+                        kicked = true;
+                    }
                 }
-            }
 
-            if (kicked)
+                if (kicked)
+                {
+                    Console.WriteLine("[ServerStats] Kicked spectators due to inactivity.");
+                }
+
+                Server.ExecuteCommand("mp_restartgame 1");
+            }
+            catch (Exception ex)
             {
-                Console.WriteLine("[ServerStats] Kicked spectators due to inactivity.");
+                Console.WriteLine($"[ServerStats] KickSpectatorsAndRestart error (possibly mid-map-transition): {ex.Message}");
             }
-
-            Server.ExecuteCommand("mp_restartgame 1");
         }
 
         private PlayerMatchData GetOrAddPlayer(CCSPlayerController player)
@@ -1113,7 +1121,8 @@ collection_id=";
                         Server.PrintToChatAll($" {ChatColors.Yellow}{data.Name} just got an Ace!");
                     }
 
-                    if (weaponName.Contains("taser", StringComparison.OrdinalIgnoreCase))
+                    bool victimIsBot = victim != null && victim.IsValid && victim.IsBot;
+                    if (weaponName.Contains("taser", StringComparison.OrdinalIgnoreCase) && !IsWarmup() && !victimIsBot)
                     {
                         data.CurrentZeusKills++;
                         if (data.CurrentZeusKills > _highestZeusKills)
@@ -1259,8 +1268,8 @@ collection_id=";
                 }
             }
 
-            // Update stats for all tracked players
-            foreach (var data in _matchData.Players)
+            // Update stats for all tracked players (snapshot to avoid collection-modified errors)
+            foreach (var data in _matchData.Players.ToList())
             {
                 var playerEntity = Utilities.GetPlayers().FirstOrDefault(p =>
                 {
