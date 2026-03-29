@@ -199,6 +199,7 @@ namespace ServerStats
         private CsTimer? _spectatorKickTimer = null;
         private CsTimer? _noHumansRestartTimer = null;
         private CancellationTokenSource _workshopCts = new();
+        private CommandInfo.CommandListenerCallback? _chatCommandDelegate;
 
         private string _steamApiKey = "";
         private const string WorkshopContentRelPath = "../bin/linuxsteamrt64/steamapps/workshop/content/730";
@@ -228,8 +229,9 @@ namespace ServerStats
             RegisterEventHandler<EventHostageFollows>(OnHostagePickup, HookMode.Post);
             RegisterEventHandler<EventHostageRescued>(OnHostageRescued, HookMode.Post);
 
-            AddCommandListener("say", OnPlayerChatCommand);
-            AddCommandListener("say_team", OnPlayerChatCommand);
+            _chatCommandDelegate = OnPlayerChatCommand;
+            AddCommandListener("say", _chatCommandDelegate);
+            AddCommandListener("say_team", _chatCommandDelegate);
 
             LoadConfigIni();
             LoadWorkshopIni();
@@ -310,6 +312,13 @@ namespace ServerStats
                 _fileWatcher.Changed -= OnConfigFileChanged;
                 _fileWatcher.Dispose();
                 _fileWatcher = null;
+            }
+
+            if (_chatCommandDelegate != null)
+            {
+                RemoveCommandListener("say", _chatCommandDelegate, HookMode.Pre);
+                RemoveCommandListener("say_team", _chatCommandDelegate, HookMode.Pre);
+                _chatCommandDelegate = null;
             }
         }
 
