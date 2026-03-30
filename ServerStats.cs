@@ -320,6 +320,20 @@ namespace ServerStats
                 RemoveCommandListener("say_team", _chatCommandDelegate, HookMode.Pre);
                 _chatCommandDelegate = null;
             }
+
+            // Deregister all event handlers to prevent GC delegate crashes after hot reload
+            DeregisterEventHandler<EventPlayerDeath>(OnPlayerDeath, HookMode.Post);
+            DeregisterEventHandler<EventRoundOfficiallyEnded>(OnRoundEnded, HookMode.Post);
+            DeregisterEventHandler<EventRoundPrestart>(OnRoundPrestart, HookMode.Post);
+            DeregisterEventHandler<EventMapShutdown>(OnMapShutdown, HookMode.Post);
+            DeregisterEventHandler<EventCsWinPanelMatch>(OnMatchEnd, HookMode.Post);
+            DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect, HookMode.Post);
+            DeregisterEventHandler<EventPlayerTeam>(OnPlayerTeam, HookMode.Post);
+            DeregisterEventHandler<EventBombPlanted>(OnBombPlanted, HookMode.Post);
+            DeregisterEventHandler<EventBombDefused>(OnBombDefused, HookMode.Post);
+            DeregisterEventHandler<EventBombExploded>(OnBombExploded, HookMode.Post);
+            DeregisterEventHandler<EventHostageFollows>(OnHostagePickup, HookMode.Post);
+            DeregisterEventHandler<EventHostageRescued>(OnHostageRescued, HookMode.Post);
         }
 
         private string ServerStatsConfigDir => Path.Combine(Server.GameDirectory, "csgo", "addons", "counterstrikesharp", "configs", "plugins", "ServerStats");
