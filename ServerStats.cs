@@ -891,13 +891,24 @@ collection_id=";
             _matchEndedNormally = true;
             _matchData.MatchComplete = true;
 
-            if (!_roundStatsSnapshotTaken)
-            {
-                SnapshotRoundStats();
-            }
+            // Kill any outstanding timers that could fire during map transition
+            if (_noHumansRestartTimer != null) { _noHumansRestartTimer.Kill(); _noHumansRestartTimer = null; }
+            if (_spectatorKickTimer != null) { _spectatorKickTimer.Kill(); _spectatorKickTimer = null; }
 
-            SaveMatchData();
-            Console.WriteLine($"[ServerStats] Match Finished. Final data saved for ID: {_matchData.MatchID}");
+            try
+            {
+                if (!_roundStatsSnapshotTaken)
+                {
+                    SnapshotRoundStats();
+                }
+
+                SaveMatchData();
+                Console.WriteLine($"[ServerStats] Match Finished. Final data saved for ID: {_matchData.MatchID}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ServerStats] OnMatchEnd error: {ex.Message}");
+            }
             return HookResult.Continue;
         }
 
@@ -916,7 +927,7 @@ collection_id=";
                 if (remainingActiveHumans == 0 && _noHumansRestartTimer == null && !_matchEndedNormally)
                 {
                     Console.WriteLine("[ServerStats] No active humans detected. Scheduling restart in 90 seconds.");
-                    _noHumansRestartTimer = AddTimer(90.0f, OnNoHumansRestartTimer);
+                    _noHumansRestartTimer = AddTimer(90.0f, OnNoHumansRestartTimer, TimerFlags.STOP_ON_MAPCHANGE);
                 }
 
                 CheckAndHandlePlayerCounts(player.Slot);
@@ -957,7 +968,7 @@ collection_id=";
                 if (_spectatorKickTimer == null)
                 {
                     Server.PrintToChatAll($" {ChatColors.Red}[SERVERSTATS] WARNING: NO ACTIVE PLAYERS. SPECTATORS WILL BE KICKED IN 30 SECONDS.");
-                    _spectatorKickTimer = AddTimer(30.0f, KickSpectatorsAndRestart);
+                    _spectatorKickTimer = AddTimer(30.0f, KickSpectatorsAndRestart, TimerFlags.STOP_ON_MAPCHANGE);
                 }
             }
             else if (activeHumans > 0)
@@ -1283,6 +1294,9 @@ collection_id=";
             if (_roundStatsSnapshotTaken) return;
             if (IsWarmup()) return;
 
+            // Mark taken immediately to prevent re-entry
+            _roundStatsSnapshotTaken = true;
+
             try
             {
                 UpdateTeamScores();
@@ -1295,13 +1309,29 @@ collection_id=";
                 _matchData.CTScoreHistory.Add(_ctWins);
                 _matchData.TScoreHistory.Add(_tWins);
 
-                // Ensure all connected players are tracked
-                foreach (var p in Utilities.GetPlayers())
+                // Get players ONCE and cache the list to avoid repeated entity iteration
+                List<CCSPlayerController> currentPlayers;
+                try
                 {
-                    if (p != null && p.IsValid && p.Connected == PlayerConnectedState.PlayerConnected)
+                    currentPlayers = Utilities.GetPlayers()
+                        .Where(p => p != null && p.IsValid)
+                        .ToList();
+                }
+                catch
+                {
+                    // Entity system may be unavailable during map transition
+                    currentPlayers = new List<CCSPlayerController>();
+                }
+
+                // Ensure all connected players are tracked
+                foreach (var p in currentPlayers)
+                {
+                    try
                     {
-                        GetOrAddPlayer(p);
+                        if (p.IsValid && p.Connected == PlayerConnectedState.PlayerConnected)
+                            GetOrAddPlayer(p);
                     }
+                    catch { /* Player handle freed mid-iteration */ }
                 }
 
                 // Update stats for all tracked players (snapshot to avoid collection-modified errors)
@@ -1309,17 +1339,36 @@ collection_id=";
                 {
                     try
                     {
-                        var playerEntity = Utilities.GetPlayers().FirstOrDefault(p =>
+                        CCSPlayerController? playerEntity = null;
+                        foreach (var p in currentPlayers)
                         {
-                            if (p == null || !p.IsValid) return false;
-                            ulong pid = p.SteamID;
-                            if (pid == 0) pid = (ulong)p.Handle.ToInt64();
-                            return pid == data.SteamID;
-                        });
+                            try
+                            {
+                                if (!p.IsValid) continue;
+                                ulong pid = p.SteamID;
+                                if (pid == 0) pid = (ulong)p.Handle.ToInt64();
+                                if (pid == data.SteamID) { playerEntity = p; break; }
+                            }
+                            catch { /* Handle freed */ }
+                        }
 
-                        if (playerEntity != null && playerEntity.IsValid)
+                        if (playerEntity != null)
                         {
-                            UpdateLivePlayerFields(playerEntity, data);
+                            try
+                            {
+                                if (playerEntity.IsValid)
+                                    UpdateLivePlayerFields(playerEntity, data);
+                                else
+                                {
+                                    data.AliveHistory.Add(false);
+                                    data.InventoryHistory.Add("");
+                                }
+                            }
+                            catch
+                            {
+                                data.AliveHistory.Add(false);
+                                data.InventoryHistory.Add("");
+                            }
                         }
                         else
                         {
@@ -1346,25 +1395,39 @@ collection_id=";
             {
                 Console.WriteLine($"[ServerStats] SnapshotRoundStats error: {ex.Message}");
             }
-
-            _roundStatsSnapshotTaken = true;
         }
 
         private void UpdateLivePlayerFields(CCSPlayerController p, PlayerMatchData data)
         {
-            data.Name = p.PlayerName ?? data.Name;
-            data.CurrentTeam = p.TeamNum;
-            data.CurrentScore = GetPlayerScore(p);
-            data.CurrentMVPs = GetPlayerMVP(p);
-
-            bool isAlive = false;
-            if (p.PlayerPawn?.Value is CCSPlayerPawn pawn && pawn.IsValid && pawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
+            try
             {
-                isAlive = true;
-            }
-            data.AliveHistory.Add(isAlive);
+                if (!p.IsValid) { data.AliveHistory.Add(false); data.InventoryHistory.Add(""); return; }
+                data.Name = p.PlayerName ?? data.Name;
+                data.CurrentTeam = p.TeamNum;
+                data.CurrentScore = GetPlayerScore(p);
+                data.CurrentMVPs = GetPlayerMVP(p);
 
-            data.InventoryHistory.Add(GetPlayerInventory(p));
+                bool isAlive = false;
+                try
+                {
+                    var pawnHandle = p.PlayerPawn;
+                    if (pawnHandle != null && pawnHandle.IsValid)
+                    {
+                        var pawn = pawnHandle.Value;
+                        if (pawn != null && pawn.IsValid && pawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
+                            isAlive = true;
+                    }
+                }
+                catch { /* Pawn handle freed during map transition */ }
+                data.AliveHistory.Add(isAlive);
+
+                data.InventoryHistory.Add(GetPlayerInventory(p));
+            }
+            catch
+            {
+                data.AliveHistory.Add(false);
+                data.InventoryHistory.Add("");
+            }
         }
 
         private void SaveMatchData()
@@ -1467,44 +1530,73 @@ collection_id=";
 
         private void PrintSinglePlayerStat(CCSPlayerController p, CommandInfo cmd)
         {
-            var data = GetOrAddPlayer(p);
-            int score = GetPlayerScore(p);
-            int money = GetPlayerMoney(p);
-
-            var pingStr = p.IsBot ? "BOT" : p.Ping.ToString();
-            string teamStr = GetTeamName(p.TeamNum);
-
-            bool isAlive = false;
-            if (p.PlayerPawn?.Value is CCSPlayerPawn pawn && pawn.IsValid && pawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
+            try
             {
-                isAlive = true;
-            }
+                if (!p.IsValid) return;
+                var data = GetOrAddPlayer(p);
+                int score = GetPlayerScore(p);
+                int money = GetPlayerMoney(p);
 
-            cmd.ReplyToCommand(
-                $"[{p.Slot}] {data.Name} | Team:{teamStr} K:{data.CurrentKills} D:{data.CurrentDeaths} A:{data.CurrentAssists} Z:{data.CurrentZeusKills} MVP:{data.CurrentMVPs} Score:{score} Money:${money} Alive:{(isAlive ? "Yes" : "No")} Ping:{pingStr}"
-            );
+                var pingStr = p.IsBot ? "BOT" : p.Ping.ToString();
+                string teamStr = GetTeamName(p.TeamNum);
+
+                bool isAlive = false;
+                try
+                {
+                    var pawnHandle = p.PlayerPawn;
+                    if (pawnHandle != null && pawnHandle.IsValid)
+                    {
+                        var pawn = pawnHandle.Value;
+                        if (pawn != null && pawn.IsValid && pawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
+                            isAlive = true;
+                    }
+                }
+                catch { /* Pawn handle freed */ }
+
+                cmd.ReplyToCommand(
+                    $"[{p.Slot}] {data.Name} | Team:{teamStr} K:{data.CurrentKills} D:{data.CurrentDeaths} A:{data.CurrentAssists} Z:{data.CurrentZeusKills} MVP:{data.CurrentMVPs} Score:{score} Money:${money} Alive:{(isAlive ? "Yes" : "No")} Ping:{pingStr}"
+                );
+            }
+            catch { /* Player freed during stat print */ }
         }
 
         private string GetPlayerInventory(CCSPlayerController player)
         {
             try
             {
-                if (player == null || !player.IsValid || player.PlayerPawn == null || !player.PlayerPawn.IsValid)
+                if (player == null || !player.IsValid)
                     return "N/A";
 
-                var pawn = player.PlayerPawn.Value;
-                if (pawn == null || !pawn.IsValid || pawn.WeaponServices == null || pawn.WeaponServices.MyWeapons == null)
+                var pawnHandle = player.PlayerPawn;
+                if (pawnHandle == null || !pawnHandle.IsValid)
+                    return "N/A";
+
+                var pawn = pawnHandle.Value;
+                if (pawn == null || !pawn.IsValid)
+                    return "None";
+
+                var weaponServices = pawn.WeaponServices;
+                if (weaponServices == null)
+                    return "None";
+
+                var myWeapons = weaponServices.MyWeapons;
+                if (myWeapons == null)
                     return "None";
 
                 List<string> weaponNames = new List<string>();
-                foreach (var weaponHandle in pawn.WeaponServices.MyWeapons)
+                foreach (var weaponHandle in myWeapons)
                 {
-                    var weapon = weaponHandle.Value;
-                    if (weapon == null || !weapon.IsValid) continue;
+                    try
+                    {
+                        if (weaponHandle == null || !weaponHandle.IsValid) continue;
+                        var weapon = weaponHandle.Value;
+                        if (weapon == null || !weapon.IsValid) continue;
 
-                    string name = weapon.DesignerName;
-                    if (name.StartsWith("weapon_")) name = name.Substring(7);
-                    weaponNames.Add(name);
+                        string name = weapon.DesignerName;
+                        if (name != null && name.StartsWith("weapon_")) name = name.Substring(7);
+                        if (!string.IsNullOrEmpty(name)) weaponNames.Add(name);
+                    }
+                    catch { /* Weapon handle freed during map transition */ }
                 }
                 return weaponNames.Count == 0 ? "None" : string.Join(", ", weaponNames);
             }
