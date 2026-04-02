@@ -194,7 +194,12 @@ namespace ServerStats
         private bool _announceAces = false;
         private int _highestZeusKills = 0;
 
+        private readonly Dictionary<int, int> _lastDeathTick = new();
+
         private CsTimer? _spectatorKickTimer = null;
+        private CsTimer? _noHumansRestartTimer = null;
+        private CancellationTokenSource _workshopCts = new();
+        private CommandInfo.CommandListenerCallback? _chatCommandDelegate;
 
         private string _steamApiKey = "";
         private const string WorkshopContentRelPath = "../bin/linuxsteamrt64/steamapps/workshop/content/730";
@@ -202,7 +207,7 @@ namespace ServerStats
 
         public override string ModuleName => "ServerStats";
         public override string ModuleVersion => "2.1.0";
-        public override string ModuleAuthor => "VinSix";
+        public override string ModuleAuthor => "|ZAPS| BONE";
 
         public override void Load(bool hotReload)
         {
@@ -224,7 +229,9 @@ namespace ServerStats
             RegisterEventHandler<EventHostageFollows>(OnHostagePickup, HookMode.Post);
             RegisterEventHandler<EventHostageRescued>(OnHostageRescued, HookMode.Post);
 
-            RegisterEventHandler<EventPlayerChat>(OnPlayerChat, HookMode.Post);
+            _chatCommandDelegate = OnPlayerChatCommand;
+            AddCommandListener("say", _chatCommandDelegate);
+            AddCommandListener("say_team", _chatCommandDelegate);
 
             LoadConfigIni();
             LoadWorkshopIni();
@@ -271,8 +278,9 @@ namespace ServerStats
             {
                 try
                 {
-                    await ProcessWorkshopCollection(baseGameDir);
+                    await ProcessWorkshopCollection(baseGameDir, _workshopCts.Token);
                 }
+                catch (OperationCanceledException) { }
                 catch (Exception ex)
                 {
                     LogWorkshopGrabber(baseGameDir, $"CRITICAL ERROR: {ex.Message}");
@@ -282,6 +290,22 @@ namespace ServerStats
 
         public override void Unload(bool hotReload)
         {
+            _workshopCts.Cancel();
+            _workshopCts.Dispose();
+            _workshopCts = new CancellationTokenSource();
+
+            if (_noHumansRestartTimer != null)
+            {
+                _noHumansRestartTimer.Kill();
+                _noHumansRestartTimer = null;
+            }
+
+            if (_spectatorKickTimer != null)
+            {
+                _spectatorKickTimer.Kill();
+                _spectatorKickTimer = null;
+            }
+
             if (_fileWatcher != null)
             {
                 _fileWatcher.EnableRaisingEvents = false;
@@ -289,6 +313,27 @@ namespace ServerStats
                 _fileWatcher.Dispose();
                 _fileWatcher = null;
             }
+
+            if (_chatCommandDelegate != null)
+            {
+                RemoveCommandListener("say", _chatCommandDelegate, HookMode.Pre);
+                RemoveCommandListener("say_team", _chatCommandDelegate, HookMode.Pre);
+                _chatCommandDelegate = null;
+            }
+
+            // Deregister all event handlers to prevent GC delegate crashes after hot reload
+            DeregisterEventHandler<EventPlayerDeath>(OnPlayerDeath, HookMode.Post);
+            DeregisterEventHandler<EventRoundOfficiallyEnded>(OnRoundEnded, HookMode.Post);
+            DeregisterEventHandler<EventRoundPrestart>(OnRoundPrestart, HookMode.Post);
+            DeregisterEventHandler<EventMapShutdown>(OnMapShutdown, HookMode.Post);
+            DeregisterEventHandler<EventCsWinPanelMatch>(OnMatchEnd, HookMode.Post);
+            DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect, HookMode.Post);
+            DeregisterEventHandler<EventPlayerTeam>(OnPlayerTeam, HookMode.Post);
+            DeregisterEventHandler<EventBombPlanted>(OnBombPlanted, HookMode.Post);
+            DeregisterEventHandler<EventBombDefused>(OnBombDefused, HookMode.Post);
+            DeregisterEventHandler<EventBombExploded>(OnBombExploded, HookMode.Post);
+            DeregisterEventHandler<EventHostageFollows>(OnHostagePickup, HookMode.Post);
+            DeregisterEventHandler<EventHostageRescued>(OnHostageRescued, HookMode.Post);
         }
 
         private string ServerStatsConfigDir => Path.Combine(Server.GameDirectory, "csgo", "addons", "counterstrikesharp", "configs", "plugins", "ServerStats");
@@ -298,7 +343,7 @@ namespace ServerStats
         private string MatchLibrarianDir => Path.Combine(Server.GameDirectory, "csgo", "addons", "counterstrikesharp", "configs", "plugins", "MatchLibrarian");
         private string MatchesDirPath => Path.Combine(MatchLibrarianDir, "matches");
 
-        private async Task ProcessWorkshopCollection(string csgoDir)
+        private async Task ProcessWorkshopCollection(string csgoDir, CancellationToken token)
         {
             string configIniPath = Path.GetFullPath(Path.Combine(csgoDir, "addons/counterstrikesharp/configs/plugins/ServerStats/config.ini"));
             string workshopIniPath = Path.GetFullPath(Path.Combine(csgoDir, "addons/counterstrikesharp/configs/plugins/ServerStats/workshop.ini"));
@@ -340,19 +385,24 @@ namespace ServerStats
                 return;
             }
 
+            token.ThrowIfCancellationRequested();
+
             LogWorkshopGrabber(csgoDir, $"Processing Collection ID from Config: {collectionId}");
 
             List<string> mapIds;
             try
             {
-                mapIds = await FetchCollectionItems(collectionId);
+                mapIds = await FetchCollectionItems(collectionId, token);
                 LogWorkshopGrabber(csgoDir, $"API success. Found {mapIds.Count} items in collection.");
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 LogWorkshopGrabber(csgoDir, $"API Request Failed: {ex.Message}");
                 return;
             }
+
+            token.ThrowIfCancellationRequested();
 
             Dictionary<string, string> validMaps = new Dictionary<string, string>();
 
@@ -417,7 +467,7 @@ namespace ServerStats
             }
         }
 
-        private async Task<List<string>> FetchCollectionItems(string collectionId)
+        private async Task<List<string>> FetchCollectionItems(string collectionId, CancellationToken token)
         {
             using var client = new HttpClient();
             var content = new FormUrlEncodedContent(new[]
@@ -427,10 +477,10 @@ namespace ServerStats
             });
 
             string url = $"https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/?key={_steamApiKey}";
-            var response = await client.PostAsync(url, content);
+            var response = await client.PostAsync(url, content, token);
             response.EnsureSuccessStatusCode();
 
-            string json = await response.Content.ReadAsStringAsync();
+            string json = await response.Content.ReadAsStringAsync(token);
             var data = JsonSerializer.Deserialize<SteamCollectionResponse>(json);
 
             List<string> ids = new List<string>();
@@ -611,6 +661,7 @@ namespace ServerStats
 
             // Clear lookups as the old objects are gone
             _playerLookup.Clear();
+            _lastDeathTick.Clear();
 
             _currentRound = 1;
             _matchEndedNormally = false;
@@ -840,13 +891,24 @@ collection_id=";
             _matchEndedNormally = true;
             _matchData.MatchComplete = true;
 
-            if (!_roundStatsSnapshotTaken)
-            {
-                SnapshotRoundStats();
-            }
+            // Kill any outstanding timers that could fire during map transition
+            if (_noHumansRestartTimer != null) { _noHumansRestartTimer.Kill(); _noHumansRestartTimer = null; }
+            if (_spectatorKickTimer != null) { _spectatorKickTimer.Kill(); _spectatorKickTimer = null; }
 
-            SaveMatchData();
-            Console.WriteLine($"[ServerStats] Match Finished. Final data saved for ID: {_matchData.MatchID}");
+            try
+            {
+                if (!_roundStatsSnapshotTaken)
+                {
+                    SnapshotRoundStats();
+                }
+
+                SaveMatchData();
+                Console.WriteLine($"[ServerStats] Match Finished. Final data saved for ID: {_matchData.MatchID}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ServerStats] OnMatchEnd error: {ex.Message}");
+            }
             return HookResult.Continue;
         }
 
@@ -862,10 +924,10 @@ collection_id=";
                     p.Slot != player.Slot &&
                     (p.TeamNum == 2 || p.TeamNum == 3));
 
-                if (remainingActiveHumans == 0)
+                if (remainingActiveHumans == 0 && _noHumansRestartTimer == null && !_matchEndedNormally)
                 {
-                    Console.WriteLine("[ServerStats] Last active human left. Restarting game to reset match.");
-                    Server.ExecuteCommand("mp_restartgame 1");
+                    Console.WriteLine("[ServerStats] No active humans detected. Scheduling restart in 90 seconds.");
+                    _noHumansRestartTimer = AddTimer(90.0f, OnNoHumansRestartTimer, TimerFlags.STOP_ON_MAPCHANGE);
                 }
 
                 CheckAndHandlePlayerCounts(player.Slot);
@@ -906,7 +968,7 @@ collection_id=";
                 if (_spectatorKickTimer == null)
                 {
                     Server.PrintToChatAll($" {ChatColors.Red}[SERVERSTATS] WARNING: NO ACTIVE PLAYERS. SPECTATORS WILL BE KICKED IN 30 SECONDS.");
-                    _spectatorKickTimer = AddTimer(30.0f, KickSpectatorsAndRestart);
+                    _spectatorKickTimer = AddTimer(30.0f, KickSpectatorsAndRestart, TimerFlags.STOP_ON_MAPCHANGE);
                 }
             }
             else if (activeHumans > 0)
@@ -917,6 +979,7 @@ collection_id=";
                     _spectatorKickTimer = null;
                     Server.PrintToChatAll(" [ServerStats] Active player joined. Spectator kick timer cancelled.");
                 }
+                CancelNoHumansRestartTimer();
             }
             else if (activeHumans == 0 && specHumans == 0 && _spectatorKickTimer != null)
             {
@@ -925,27 +988,73 @@ collection_id=";
             }
         }
 
+        private void CancelNoHumansRestartTimer()
+        {
+            if (_noHumansRestartTimer != null)
+            {
+                _noHumansRestartTimer.Kill();
+                _noHumansRestartTimer = null;
+                Console.WriteLine("[ServerStats] No-humans restart timer cancelled. Active players present.");
+            }
+        }
+
+        private void OnNoHumansRestartTimer()
+        {
+            _noHumansRestartTimer = null;
+
+            try
+            {
+                var activeHumans = Utilities.GetPlayers().Count(p =>
+                    p != null &&
+                    p.IsValid &&
+                    !p.IsBot &&
+                    !p.IsHLTV &&
+                    (p.TeamNum == 2 || p.TeamNum == 3));
+
+                if (activeHumans > 0)
+                {
+                    Console.WriteLine("[ServerStats] No-humans restart aborted. Active players found.");
+                    return;
+                }
+
+                Console.WriteLine("[ServerStats] Last active human left. Restarting game to reset match.");
+                Server.ExecuteCommand("mp_restartgame 1");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ServerStats] No-humans restart timer error (possibly mid-map-transition): {ex.Message}");
+            }
+        }
+
         private void KickSpectatorsAndRestart()
         {
             _spectatorKickTimer = null;
-            var allPlayers = Utilities.GetPlayers();
-            bool kicked = false;
 
-            foreach (var p in allPlayers)
+            try
             {
-                if (p != null && p.IsValid && !p.IsBot && !p.IsHLTV && p.TeamNum == 1)
+                var allPlayers = Utilities.GetPlayers();
+                bool kicked = false;
+
+                foreach (var p in allPlayers)
                 {
-                    Server.ExecuteCommand($"kickid {p.UserId} \"AFK Spectator\"");
-                    kicked = true;
+                    if (p != null && p.IsValid && !p.IsBot && !p.IsHLTV && p.TeamNum == 1)
+                    {
+                        Server.ExecuteCommand($"kickid {p.UserId} \"AFK Spectator\"");
+                        kicked = true;
+                    }
                 }
-            }
 
-            if (kicked)
+                if (kicked)
+                {
+                    Console.WriteLine("[ServerStats] Kicked spectators due to inactivity.");
+                }
+
+                Server.ExecuteCommand("mp_restartgame 1");
+            }
+            catch (Exception ex)
             {
-                Console.WriteLine("[ServerStats] Kicked spectators due to inactivity.");
+                Console.WriteLine($"[ServerStats] KickSpectatorsAndRestart error (possibly mid-map-transition): {ex.Message}");
             }
-
-            Server.ExecuteCommand("mp_restartgame 1");
         }
 
         private PlayerMatchData GetOrAddPlayer(CCSPlayerController player)
@@ -1006,6 +1115,16 @@ collection_id=";
             try
             {
                 var victim = @event.Userid;
+
+                // Prevent processing duplicate events for the same death on the same tick
+                if (victim != null && victim.IsValid)
+                {
+                    int tick = Server.TickCount;
+                    if (_lastDeathTick.TryGetValue(victim.Slot, out int lastTick) && lastTick == tick)
+                        return HookResult.Continue;
+                    _lastDeathTick[victim.Slot] = tick;
+                }
+
                 var attacker = @event.Attacker;
                 var assister = @event.Assister;
                 string weaponName = @event.Weapon ?? "unknown";
@@ -1048,7 +1167,7 @@ collection_id=";
                     }
 
                     bool victimIsBot = victim != null && victim.IsValid && victim.IsBot;
-                    if (weaponName.Contains("taser", StringComparison.OrdinalIgnoreCase) && !victimIsBot)
+                    if (weaponName.Contains("taser", StringComparison.OrdinalIgnoreCase) && !IsWarmup() && !victimIsBot)
                     {
                         data.CurrentZeusKills++;
                         if (data.CurrentZeusKills > _highestZeusKills)
@@ -1137,18 +1256,22 @@ collection_id=";
             return HookResult.Continue;
         }
 
-        private HookResult OnPlayerChat(EventPlayerChat @event, GameEventInfo info)
+        private HookResult OnPlayerChatCommand(CCSPlayerController? player, CommandInfo info)
         {
-            var player = Utilities.GetPlayerFromUserid(@event.Userid);
             if (player == null || !player.IsValid) return HookResult.Continue;
+
+            string message = info.GetArg(1);
+            if (string.IsNullOrEmpty(message)) return HookResult.Continue;
+
+            bool isTeamChat = info.GetArg(0).Equals("say_team", StringComparison.OrdinalIgnoreCase);
 
             _matchData.ChatFeed.Add(new ChatLog
             {
                 Round = _currentRound,
                 PlayerName = player.PlayerName ?? "Unknown",
                 PlayerSteamID = player.SteamID,
-                Message = @event.Text ?? "",
-                TeamChat = @event.Teamonly,
+                Message = message,
+                TeamChat = isTeamChat,
                 Timestamp = DateTime.UtcNow.ToString("HH:mm:ss")
             });
 
@@ -1171,73 +1294,140 @@ collection_id=";
             if (_roundStatsSnapshotTaken) return;
             if (IsWarmup()) return;
 
-            UpdateTeamScores();
-
-            // Direct modification of _matchData properties
-            _matchData.CTWins = _ctWins;
-            _matchData.TWins = _tWins;
-            _matchData.TotalRounds = _ctWins + _tWins;
-
-            _matchData.CTScoreHistory.Add(_ctWins);
-            _matchData.TScoreHistory.Add(_tWins);
-
-            // Ensure all connected players are tracked
-            foreach (var p in Utilities.GetPlayers())
-            {
-                if (p != null && p.IsValid && p.Connected == PlayerConnectedState.PlayerConnected)
-                {
-                    GetOrAddPlayer(p);
-                }
-            }
-
-            // Update stats for all tracked players
-            foreach (var data in _matchData.Players)
-            {
-                var playerEntity = Utilities.GetPlayers().FirstOrDefault(p =>
-                {
-                    if (p == null || !p.IsValid) return false;
-                    ulong pid = p.SteamID;
-                    if (pid == 0) pid = (ulong)p.Handle.ToInt64();
-                    return pid == data.SteamID;
-                });
-
-                if (playerEntity != null && playerEntity.IsValid)
-                {
-                    UpdateLivePlayerFields(playerEntity, data);
-                }
-                else
-                {
-                    data.AliveHistory.Add(false);
-                    data.InventoryHistory.Add("");
-                }
-
-                data.TeamHistory.Add(data.CurrentTeam);
-                data.KillsHistory.Add(data.CurrentKills);
-                data.DeathsHistory.Add(data.CurrentDeaths);
-                data.AssistsHistory.Add(data.CurrentAssists);
-                data.ZeusKillsHistory.Add(data.CurrentZeusKills);
-                data.MVPsHistory.Add(data.CurrentMVPs);
-                data.ScoreHistory.Add(data.CurrentScore);
-            }
-
+            // Mark taken immediately to prevent re-entry
             _roundStatsSnapshotTaken = true;
+
+            try
+            {
+                UpdateTeamScores();
+
+                // Direct modification of _matchData properties
+                _matchData.CTWins = _ctWins;
+                _matchData.TWins = _tWins;
+                _matchData.TotalRounds = _ctWins + _tWins;
+
+                _matchData.CTScoreHistory.Add(_ctWins);
+                _matchData.TScoreHistory.Add(_tWins);
+
+                // Get players ONCE and cache the list to avoid repeated entity iteration
+                List<CCSPlayerController> currentPlayers;
+                try
+                {
+                    currentPlayers = Utilities.GetPlayers()
+                        .Where(p => p != null && p.IsValid)
+                        .ToList();
+                }
+                catch
+                {
+                    // Entity system may be unavailable during map transition
+                    currentPlayers = new List<CCSPlayerController>();
+                }
+
+                // Ensure all connected players are tracked
+                foreach (var p in currentPlayers)
+                {
+                    try
+                    {
+                        if (p.IsValid && p.Connected == PlayerConnectedState.PlayerConnected)
+                            GetOrAddPlayer(p);
+                    }
+                    catch { /* Player handle freed mid-iteration */ }
+                }
+
+                // Update stats for all tracked players (snapshot to avoid collection-modified errors)
+                foreach (var data in _matchData.Players.ToList())
+                {
+                    try
+                    {
+                        CCSPlayerController? playerEntity = null;
+                        foreach (var p in currentPlayers)
+                        {
+                            try
+                            {
+                                if (!p.IsValid) continue;
+                                ulong pid = p.SteamID;
+                                if (pid == 0) pid = (ulong)p.Handle.ToInt64();
+                                if (pid == data.SteamID) { playerEntity = p; break; }
+                            }
+                            catch { /* Handle freed */ }
+                        }
+
+                        if (playerEntity != null)
+                        {
+                            try
+                            {
+                                if (playerEntity.IsValid)
+                                    UpdateLivePlayerFields(playerEntity, data);
+                                else
+                                {
+                                    data.AliveHistory.Add(false);
+                                    data.InventoryHistory.Add("");
+                                }
+                            }
+                            catch
+                            {
+                                data.AliveHistory.Add(false);
+                                data.InventoryHistory.Add("");
+                            }
+                        }
+                        else
+                        {
+                            data.AliveHistory.Add(false);
+                            data.InventoryHistory.Add("");
+                        }
+                    }
+                    catch
+                    {
+                        data.AliveHistory.Add(false);
+                        data.InventoryHistory.Add("");
+                    }
+
+                    data.TeamHistory.Add(data.CurrentTeam);
+                    data.KillsHistory.Add(data.CurrentKills);
+                    data.DeathsHistory.Add(data.CurrentDeaths);
+                    data.AssistsHistory.Add(data.CurrentAssists);
+                    data.ZeusKillsHistory.Add(data.CurrentZeusKills);
+                    data.MVPsHistory.Add(data.CurrentMVPs);
+                    data.ScoreHistory.Add(data.CurrentScore);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ServerStats] SnapshotRoundStats error: {ex.Message}");
+            }
         }
 
         private void UpdateLivePlayerFields(CCSPlayerController p, PlayerMatchData data)
         {
-            data.Name = p.PlayerName ?? data.Name;
-            data.CurrentTeam = p.TeamNum;
-            data.CurrentScore = GetPlayerScore(p);
-            data.CurrentMVPs = GetPlayerMVP(p);
-
-            bool isAlive = false;
-            if (p.PlayerPawn?.Value is CCSPlayerPawn pawn && pawn.IsValid && pawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
+            try
             {
-                isAlive = true;
-            }
-            data.AliveHistory.Add(isAlive);
+                if (!p.IsValid) { data.AliveHistory.Add(false); data.InventoryHistory.Add(""); return; }
+                data.Name = p.PlayerName ?? data.Name;
+                data.CurrentTeam = p.TeamNum;
+                data.CurrentScore = GetPlayerScore(p);
+                data.CurrentMVPs = GetPlayerMVP(p);
 
-            data.InventoryHistory.Add(GetPlayerInventory(p));
+                bool isAlive = false;
+                try
+                {
+                    var pawnHandle = p.PlayerPawn;
+                    if (pawnHandle != null && pawnHandle.IsValid)
+                    {
+                        var pawn = pawnHandle.Value;
+                        if (pawn != null && pawn.IsValid && pawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
+                            isAlive = true;
+                    }
+                }
+                catch { /* Pawn handle freed during map transition */ }
+                data.AliveHistory.Add(isAlive);
+
+                data.InventoryHistory.Add(GetPlayerInventory(p));
+            }
+            catch
+            {
+                data.AliveHistory.Add(false);
+                data.InventoryHistory.Add("");
+            }
         }
 
         private void SaveMatchData()
@@ -1340,44 +1530,80 @@ collection_id=";
 
         private void PrintSinglePlayerStat(CCSPlayerController p, CommandInfo cmd)
         {
-            var data = GetOrAddPlayer(p);
-            int score = GetPlayerScore(p);
-            int money = GetPlayerMoney(p);
-
-            var pingStr = p.IsBot ? "BOT" : p.Ping.ToString();
-            string teamStr = GetTeamName(p.TeamNum);
-
-            bool isAlive = false;
-            if (p.PlayerPawn?.Value is CCSPlayerPawn pawn && pawn.IsValid && pawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
+            try
             {
-                isAlive = true;
-            }
+                if (!p.IsValid) return;
+                var data = GetOrAddPlayer(p);
+                int score = GetPlayerScore(p);
+                int money = GetPlayerMoney(p);
 
-            cmd.ReplyToCommand(
-                $"[{p.Slot}] {data.Name} | Team:{teamStr} K:{data.CurrentKills} D:{data.CurrentDeaths} A:{data.CurrentAssists} Z:{data.CurrentZeusKills} MVP:{data.CurrentMVPs} Score:{score} Money:${money} Alive:{(isAlive ? "Yes" : "No")} Ping:{pingStr}"
-            );
+                var pingStr = p.IsBot ? "BOT" : p.Ping.ToString();
+                string teamStr = GetTeamName(p.TeamNum);
+
+                bool isAlive = false;
+                try
+                {
+                    var pawnHandle = p.PlayerPawn;
+                    if (pawnHandle != null && pawnHandle.IsValid)
+                    {
+                        var pawn = pawnHandle.Value;
+                        if (pawn != null && pawn.IsValid && pawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
+                            isAlive = true;
+                    }
+                }
+                catch { /* Pawn handle freed */ }
+
+                cmd.ReplyToCommand(
+                    $"[{p.Slot}] {data.Name} | Team:{teamStr} K:{data.CurrentKills} D:{data.CurrentDeaths} A:{data.CurrentAssists} Z:{data.CurrentZeusKills} MVP:{data.CurrentMVPs} Score:{score} Money:${money} Alive:{(isAlive ? "Yes" : "No")} Ping:{pingStr}"
+                );
+            }
+            catch { /* Player freed during stat print */ }
         }
 
         private string GetPlayerInventory(CCSPlayerController player)
         {
-            if (player == null || !player.IsValid || player.PlayerPawn == null || !player.PlayerPawn.IsValid)
-                return "N/A";
-
-            var pawn = player.PlayerPawn.Value;
-            if (pawn == null || !pawn.IsValid || pawn.WeaponServices == null || pawn.WeaponServices.MyWeapons == null)
-                return "None";
-
-            List<string> weaponNames = new List<string>();
-            foreach (var weaponHandle in pawn.WeaponServices.MyWeapons)
+            try
             {
-                var weapon = weaponHandle.Value;
-                if (weapon == null || !weapon.IsValid) continue;
+                if (player == null || !player.IsValid)
+                    return "N/A";
 
-                string name = weapon.DesignerName;
-                if (name.StartsWith("weapon_")) name = name.Substring(7);
-                weaponNames.Add(name);
+                var pawnHandle = player.PlayerPawn;
+                if (pawnHandle == null || !pawnHandle.IsValid)
+                    return "N/A";
+
+                var pawn = pawnHandle.Value;
+                if (pawn == null || !pawn.IsValid)
+                    return "None";
+
+                var weaponServices = pawn.WeaponServices;
+                if (weaponServices == null)
+                    return "None";
+
+                var myWeapons = weaponServices.MyWeapons;
+                if (myWeapons == null)
+                    return "None";
+
+                List<string> weaponNames = new List<string>();
+                foreach (var weaponHandle in myWeapons)
+                {
+                    try
+                    {
+                        if (weaponHandle == null || !weaponHandle.IsValid) continue;
+                        var weapon = weaponHandle.Value;
+                        if (weapon == null || !weapon.IsValid) continue;
+
+                        string name = weapon.DesignerName;
+                        if (name != null && name.StartsWith("weapon_")) name = name.Substring(7);
+                        if (!string.IsNullOrEmpty(name)) weaponNames.Add(name);
+                    }
+                    catch { /* Weapon handle freed during map transition */ }
+                }
+                return weaponNames.Count == 0 ? "None" : string.Join(", ", weaponNames);
             }
-            return weaponNames.Count == 0 ? "None" : string.Join(", ", weaponNames);
+            catch
+            {
+                return "N/A";
+            }
         }
 
         private int GetPlayerMoney(CCSPlayerController player)
